@@ -240,8 +240,17 @@ Configure through environment variables (see `.env.example`):
 - `QUEUE_CONNECTION=database`, `MAIL_MAILER=log` (or real SMTP)
 
 The Docker image runs migrations/seeders on start when `RUN_MIGRATIONS=true` / `RUN_SEEDERS=true`.
-Run the same image three times: `php-fpm` (behind nginx), `php artisan queue:work` and
-`php artisan schedule:work`. If the host cannot run a long-lived worker, schedule
+Run the same image three times, choosing the role with `CONTAINER_ROLE`:
+
+| `CONTAINER_ROLE` | Runs                                                             |
+|------------------|------------------------------------------------------------------|
+| `web`            | nginx + PHP-FPM in one container, listening on `$PORT` (default 8080) |
+| `queue`          | `php artisan queue:work --tries=5 --backoff=10 --max-time=3600`  |
+| `scheduler`      | `php artisan schedule:work`                                      |
+
+Without `CONTAINER_ROLE` the image runs plain PHP-FPM, which is what `docker-compose.yml` uses behind its
+own nginx container. In production `APP_KEY` must be set explicitly (the container refuses to start
+without it), because separate services do not share a filesystem. If the host cannot run a long-lived worker, schedule
 `php artisan queue:work --stop-when-empty` every minute instead: the outbox relay guarantees
 nothing is lost, at the cost of up to a minute of notification latency.
 

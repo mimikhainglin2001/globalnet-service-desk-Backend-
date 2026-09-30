@@ -14,7 +14,7 @@ The project is split into two repositories:
 
 | What         | URL                                     |
 | ------------ | --------------------------------------- |
-| Web app      | `https://<your-app>.vercel.app`         |
+| Web app      | https://globalnet-service-desk-frontend.vercel.app |
 | API base URL | `https://<your-api-host>/api/v1`        |
 | API spec     | [`api/docs/openapi.yaml`](api/docs/openapi.yaml) |
 
@@ -184,27 +184,43 @@ GitHub Actions runs lint and tests for both repositories on every push.
 API's HTTPS URL. `vercel.json` rewrites all routes to `index.html`, so deep links such as `/tickets/123`
 work after a refresh.
 
-**API.** The Docker image in `api/Dockerfile` runs on any container host (Railway, Render, DigitalOcean,
-Fly.io) with a hosted MySQL database. Set these environment variables:
+**API on Railway.** One Railway project holds a MySQL database and three services built from the same
+`api/Dockerfile`. The `CONTAINER_ROLE` variable picks what each one runs:
+
+| Service     | `CONTAINER_ROLE` | Purpose                                                   |
+| ----------- | ---------------- | --------------------------------------------------------- |
+| `api`       | `web`            | nginx + PHP-FPM on Railway's `$PORT`; runs migrations and seeders on deploy |
+| `queue`     | `queue`          | `queue:work`, processes outbox events and notifications  |
+| `scheduler` | `scheduler`      | `schedule:work`, runs the SLA check and the outbox relay |
+
+Each service uses **Root Directory** `/api` and these variables (MySQL values are Railway references):
 
 ```
 APP_ENV=production
 APP_DEBUG=false
-APP_KEY=base64:...
+APP_KEY=base64:...                     # php artisan key:generate --show; same value in all services
 APP_URL=https://<your-api-host>
-DB_HOST=... DB_PORT=... DB_DATABASE=... DB_USERNAME=... DB_PASSWORD=...
-FRONTEND_URL=https://<your-app>.vercel.app
-CORS_ALLOWED_ORIGINS=https://<your-app>.vercel.app
+LOG_CHANNEL=stderr
+DB_CONNECTION=mysql
+DB_HOST=${{MySQL.MYSQLHOST}}
+DB_PORT=${{MySQL.MYSQLPORT}}
+DB_DATABASE=${{MySQL.MYSQLDATABASE}}
+DB_USERNAME=${{MySQL.MYSQLUSER}}
+DB_PASSWORD=${{MySQL.MYSQLPASSWORD}}
+SESSION_DRIVER=array
+CACHE_STORE=database
 QUEUE_CONNECTION=database
 MAIL_MAILER=log
-RUN_MIGRATIONS=true
-RUN_SEEDERS=true
+FRONTEND_URL=https://globalnet-service-desk-frontend.vercel.app
+CORS_ALLOWED_ORIGINS=https://globalnet-service-desk-frontend.vercel.app
+CONTAINER_ROLE=web                     # queue / scheduler for the other two services
+RUN_MIGRATIONS=true                    # api service only
+RUN_SEEDERS=true                       # api service only; seeders are idempotent
 ```
 
-Run the same image three times: the web process (PHP-FPM behind nginx), `php artisan queue:work` and
-`php artisan schedule:work`. If the host cannot run a long-lived worker, schedule
-`php artisan queue:work --stop-when-empty` every minute instead. The outbox relay guarantees nothing is lost,
-at the cost of up to a minute of notification delay.
+The `api` service gets a public domain and uses `/up` as its health check. If a host cannot run a long-lived
+worker, schedule `php artisan queue:work --stop-when-empty` every minute instead. The outbox relay guarantees
+nothing is lost, at the cost of up to a minute of notification delay.
 
 **CORS and Sanctum.** Only the origins in `CORS_ALLOWED_ORIGINS` are allowed (plus an optional
 `CORS_ALLOWED_ORIGINS_PATTERN` regex for Vercel preview URLs). The `Idempotent-Replayed` header is exposed

@@ -9,14 +9,17 @@ COPY . .
 RUN composer dump-autoload --no-dev --optimize --classmap-authoritative --no-scripts
 
 # ---- Runtime ---------------------------------------------------------------
-# One image, three roles (php-fpm, queue worker, scheduler) chosen by the command.
+# One image, several roles chosen by the command or CONTAINER_ROLE:
+# php-fpm (behind a separate nginx), web (nginx + php-fpm), queue, scheduler.
 FROM php:8.4-fpm-alpine
 
 COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/local/bin/
-RUN install-php-extensions pdo_mysql intl zip opcache pcntl bcmath
+RUN install-php-extensions pdo_mysql intl zip opcache pcntl bcmath \
+    && apk add --no-cache nginx
 
 COPY docker/php/opcache.ini /usr/local/etc/php/conf.d/opcache.ini
 COPY docker/php/uploads.ini /usr/local/etc/php/conf.d/uploads.ini
+COPY docker/nginx/single-container.conf /etc/nginx/single-container.conf
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint
 
 WORKDIR /var/www/html
