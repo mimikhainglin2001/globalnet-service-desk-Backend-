@@ -471,6 +471,12 @@ paths:
                           max_size_kb: { type: integer }
                           allowed_types: { type: array, items: { type: string } }
                       reopen_window_days: { type: integer }
+                      ticket_sort_fields: { type: array, items: { type: string } }
+                      tickets_per_page:
+                        type: object
+                        properties:
+                          default: { type: integer }
+                          max: { type: integer }
   /categories:
     get:
       tags: [Lookups]

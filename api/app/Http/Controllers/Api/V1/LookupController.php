@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api\V1;
 
+use App\DTOs\TicketFilters;
 use App\Enums\CommentType;
 use App\Enums\Role;
 use App\Enums\TicketPriority;
@@ -42,6 +43,11 @@ class LookupController extends Controller
                     'allowed_types' => config('servicedesk.attachments.allowed_mimes'),
                 ],
                 'reopen_window_days' => config('servicedesk.tickets.reopen_window_days'),
+                'ticket_sort_fields' => TicketFilters::SORTABLE,
+                'tickets_per_page' => [
+                    'default' => config('servicedesk.tickets.default_per_page'),
+                    'max' => config('servicedesk.tickets.max_per_page'),
+                ],
             ],
         ]);
     }
