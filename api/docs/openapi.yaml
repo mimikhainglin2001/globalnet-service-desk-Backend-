@@ -1,0 +1,1073 @@
+openapi: 3.0.3
+info:
+  title: GlobalNet Service Desk API
+  version: 1.0.0
+  description: |
+    REST API for the GlobalNet customer request & ticket portal.
+
+    **Authentication**: Laravel Sanctum personal access tokens. Obtain a token from
+    `POST /auth/login` or `POST /auth/register` and send it as `Authorization: Bearer <token>`.
+
+    **Errors** always use the same shape:
+    `{ "message": string, "code": string, "errors"?: { field: [messages] } }`
+    with codes `validation_failed` (422), `unauthenticated` (401), `forbidden` (403),
+    `not_found` (404), `conflict` (409), `too_many_requests` (429), `server_error` (500).
+
+    **Roles**: `customer`, `agent`, `admin`. Authorization is enforced server side with
+    Laravel policies and gates.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Docker (nginx)
+  - url: http://localhost:8000/api/v1
+    description: php artisan serve
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+  - name: Tickets
+  - name: Comments
+  - name: Attachments
+  - name: Notifications
+  - name: Lookups
+  - name: Dashboard
+  - name: Admin
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a customer account (rate limited)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, password_confirmation]
+              properties:
+                name: { type: string, example: Jane Doe }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, description: Letters and numbers }
+                password_confirmation: { type: string }
+      responses:
+        '201': { $ref: '#/components/responses/AuthToken' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in and receive a bearer token (rate limited per email + IP)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: agent@globalnet.test }
+                password: { type: string, example: Password123! }
+      responses:
+        '200': { $ref: '#/components/responses/AuthToken' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Email a password reset link (always returns 200)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Reset password with the emailed token (revokes all tokens)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, email, password, password_confirmation]
+              properties:
+                token: { type: string }
+                email: { type: string, format: email }
+                password: { type: string }
+                password_confirmation: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the current token
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+
+  /tickets:
+    get:
+      tags: [Tickets]
+      summary: List tickets visible to the current user
+      description: Customers see their own tickets, agents the tickets of their teams (or assigned to them), admins all.
+      parameters:
+        - { in: query, name: search, schema: { type: string }, description: Reference prefix or full-text on subject/description }
+        - { in: query, name: status, schema: { $ref: '#/components/schemas/TicketStatus' } }
+        - { in: query, name: priority, schema: { $ref: '#/components/schemas/TicketPriority' } }
+        - { in: query, name: category_id, schema: { type: integer } }
+        - { in: query, name: team_id, schema: { type: integer } }
+        - { in: query, name: assignee_id, schema: { type: integer } }
+        - { in: query, name: unassigned, schema: { type: boolean } }
+        - { in: query, name: created_from, schema: { type: string, format: date } }
+        - { in: query, name: created_to, schema: { type: string, format: date } }
+        - { in: query, name: overdue, schema: { type: boolean } }
+        - { in: query, name: sort, schema: { type: string, enum: [created_at, updated_at, due_at, priority, status, reference], default: created_at } }
+        - { in: query, name: direction, schema: { type: string, enum: [asc, desc], default: desc } }
+        - { $ref: '#/components/parameters/PerPage' }
+        - { $ref: '#/components/parameters/Page' }
+      responses:
+        '200':
+          description: Paginated tickets
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Ticket' } }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      tags: [Tickets]
+      summary: Create a ticket (supports Idempotency-Key)
+      description: |
+        The due date is derived from the SLA rule of the priority. Customers cannot choose a team;
+        the ticket is routed to the category's team. With an `Idempotency-Key` header the same key
+        and payload within 24 hours returns the original response (`Idempotent-Replayed: true`);
+        the same key with a different payload returns 409.
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string, maxLength: 255 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTicket' }
+          multipart/form-data:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CreateTicket'
+                - type: object
+                  properties:
+                    attachments[]:
+                      type: array
+                      maxItems: 3
+                      items: { type: string, format: binary }
+                      description: Max 3 files per ticket, 2 MB each; jpg, jpeg, png, gif, pdf, txt, doc, docx, xls, xlsx, csv, zip
+      responses:
+        '201':
+          description: Created (or replayed)
+          headers:
+            Idempotent-Replayed:
+              schema: { type: string, enum: ['true', 'false'] }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  data: { $ref: '#/components/schemas/Ticket' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /tickets/{ticket}:
+    parameters: [{ $ref: '#/components/parameters/TicketId' }]
+    get:
+      tags: [Tickets]
+      summary: Ticket detail
+      responses:
+        '200': { $ref: '#/components/responses/TicketResponse' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Tickets]
+      summary: Update triage fields (agents of the team / admins)
+      description: Changing the priority re-derives due_at from the ticket's creation time.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                priority: { $ref: '#/components/schemas/TicketPriority' }
+                category_id: { type: integer }
+                team_id: { type: integer, nullable: true }
+      responses:
+        '200': { $ref: '#/components/responses/TicketResponse' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /tickets/{ticket}/status:
+    parameters: [{ $ref: '#/components/parameters/TicketId' }]
+    patch:
+      tags: [Tickets]
+      summary: Change status through the state machine
+      description: |
+        Allowed graph: open → in_progress | waiting_on_customer | resolved | closed;
+        in_progress → waiting_on_customer | resolved | closed;
+        waiting_on_customer → in_progress | resolved | closed;
+        resolved → open | in_progress | closed; closed → open.
+        Customers may only close their own ticket or reopen it within 7 days.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/TicketStatus' }
+      responses:
+        '200': { $ref: '#/components/responses/TicketResponse' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /tickets/{ticket}/assign:
+    parameters: [{ $ref: '#/components/parameters/TicketId' }]
+    patch:
+      tags: [Tickets]
+      summary: Assign or unassign
+      description: Admins may assign any agent of the ticket's team (or an admin); agents may only assign or release themselves.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assignee_id]
+              properties:
+                assignee_id: { type: integer, nullable: true }
+      responses:
+        '200': { $ref: '#/components/responses/TicketResponse' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /tickets/{ticket}/comments:
+    parameters: [{ $ref: '#/components/parameters/TicketId' }]
+    get:
+      tags: [Comments]
+      summary: Conversation thread (internal notes only returned to staff)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Comment' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Comments]
+      summary: Add a public reply or an internal note (staff only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, maxLength: 5000 }
+                type: { type: string, enum: [public, internal], default: public }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Comment' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /tickets/{ticket}/attachments:
+    parameters: [{ $ref: '#/components/parameters/TicketId' }]
+    post:
+      tags: [Attachments]
+      summary: Upload attachments (max 3 per ticket, 2 MB each, whitelisted types)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: ['attachments[]']
+              properties:
+                attachments[]:
+                  type: array
+                  items: { type: string, format: binary }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Attachment' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /attachments/{attachment}/download:
+    get:
+      tags: [Attachments]
+      summary: Download an attachment (same visibility as the ticket)
+      parameters:
+        - { in: path, name: attachment, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: File stream
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /tickets/{ticket}/activity:
+    parameters: [{ $ref: '#/components/parameters/TicketId' }]
+    get:
+      tags: [Tickets]
+      summary: Activity timeline from the audit log (staff only)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/AuditLog' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: Database notifications for the bell
+      parameters:
+        - { in: query, name: unread, schema: { type: boolean } }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+                      meta:
+                        type: object
+                        properties:
+                          unread_count: { type: integer }
+  /notifications/unread-count:
+    get:
+      tags: [Notifications]
+      summary: Unread notification count
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unread_count: { type: integer }
+  /notifications/{id}/read:
+    post:
+      tags: [Notifications]
+      summary: Mark one notification as read
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Notification' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+
+  /meta:
+    get:
+      tags: [Lookups]
+      summary: Enum options and limits for forms
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      statuses: { type: array, items: { $ref: '#/components/schemas/Option' } }
+                      priorities: { type: array, items: { $ref: '#/components/schemas/Option' } }
+                      roles: { type: array, items: { $ref: '#/components/schemas/Option' } }
+                      comment_types: { type: array, items: { $ref: '#/components/schemas/Option' } }
+                      attachments:
+                        type: object
+                        properties:
+                          max_files: { type: integer }
+                          max_size_kb: { type: integer }
+                          allowed_types: { type: array, items: { type: string } }
+                      reopen_window_days: { type: integer }
+  /categories:
+    get:
+      tags: [Lookups]
+      summary: Active categories
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Category' } }
+  /teams:
+    get:
+      tags: [Lookups]
+      summary: Teams
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Team' } }
+  /agents:
+    get:
+      tags: [Lookups]
+      summary: Staff users for assignee pickers (staff only)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/User' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Agent/admin statistics (scoped to the agent's teams)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      by_status: { type: object, additionalProperties: { type: integer } }
+                      open_by_priority: { type: object, additionalProperties: { type: integer } }
+                      overdue: { type: integer }
+                      unassigned_open: { type: integer }
+                      assigned_to_me_open: { type: integer }
+                      avg_first_response_minutes: { type: number, nullable: true }
+                      resolved_last_days: { type: integer, example: 7 }
+                      resolved_recently: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List users
+      parameters:
+        - { in: query, name: search, schema: { type: string } }
+        - { in: query, name: role, schema: { $ref: '#/components/schemas/Role' } }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/User' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Admin]
+      summary: Create a user with a role
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, role]
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                password: { type: string }
+                role: { $ref: '#/components/schemas/Role' }
+                team_ids: { type: array, items: { type: integer } }
+      responses:
+        '201': { $ref: '#/components/responses/UserResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /admin/users/{user}:
+    parameters:
+      - { in: path, name: user, required: true, schema: { type: integer } }
+    get:
+      tags: [Admin]
+      summary: Show user
+      responses:
+        '200': { $ref: '#/components/responses/UserResponse' }
+    patch:
+      tags: [Admin]
+      summary: Update user, role (audited, revokes tokens) and team membership
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                password: { type: string }
+                role: { $ref: '#/components/schemas/Role' }
+                team_ids: { type: array, items: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/UserResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /admin/teams:
+    get:
+      tags: [Admin]
+      summary: List teams with members
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Admin]
+      summary: Create team
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamInput' }
+      responses:
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /admin/teams/{team}:
+    parameters:
+      - { in: path, name: team, required: true, schema: { type: integer } }
+    get:
+      tags: [Admin]
+      summary: Show team
+      responses:
+        '200': { description: OK }
+    patch:
+      tags: [Admin]
+      summary: Update team / sync members
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamInput' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [Admin]
+      summary: Delete team
+      responses:
+        '204': { description: Deleted }
+
+  /admin/categories:
+    get:
+      tags: [Admin]
+      summary: List all categories (including inactive)
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Admin]
+      summary: Create category
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CategoryInput' }
+      responses:
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /admin/categories/{category}:
+    parameters:
+      - { in: path, name: category, required: true, schema: { type: integer } }
+    patch:
+      tags: [Admin]
+      summary: Update category
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CategoryInput' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [Admin]
+      summary: Delete an unused category (409 if tickets use it)
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /admin/sla-rules:
+    get:
+      tags: [Admin]
+      summary: List SLA rules
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/SlaRule' } }
+    post:
+      tags: [Admin]
+      summary: Create SLA rule (one per priority)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SlaRuleInput' }
+      responses:
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /admin/sla-rules/{slaRule}:
+    parameters:
+      - { in: path, name: slaRule, required: true, schema: { type: integer } }
+    patch:
+      tags: [Admin]
+      summary: Update SLA rule (audited)
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SlaRuleInput' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [Admin]
+      summary: Delete SLA rule (config fallback hours then apply)
+      responses:
+        '204': { description: Deleted }
+
+  /admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: Audit log (who changed what and when)
+      parameters:
+        - { in: query, name: type, schema: { type: string, enum: [ticket, user, sla_rule, team, category] } }
+        - { in: query, name: auditable_id, schema: { type: integer } }
+        - { in: query, name: user_id, schema: { type: integer } }
+        - { in: query, name: action, schema: { type: string, enum: [created, updated, deleted] } }
+        - { in: query, name: from, schema: { type: string, format: date } }
+        - { in: query, name: to, schema: { type: string, format: date } }
+        - { $ref: '#/components/parameters/PerPage' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/AuditLog' } }
+
+  /admin/failed-jobs:
+    get:
+      tags: [Admin]
+      summary: Laravel failed_jobs (dead letters)
+      responses:
+        '200': { description: OK }
+  /admin/failed-jobs/{uuid}/retry:
+    post:
+      tags: [Admin]
+      summary: Push a failed job back onto the queue
+      parameters:
+        - { in: path, name: uuid, required: true, schema: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /admin/outbox-events:
+    get:
+      tags: [Admin]
+      summary: Outbox events by state (default failed)
+      parameters:
+        - { in: query, name: status, schema: { type: string, enum: [failed, pending, processed], default: failed } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginated'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/OutboxEvent' } }
+  /admin/outbox-events/{outboxEvent}/retry:
+    post:
+      tags: [Admin]
+      summary: Re-queue a dead-lettered outbox event
+      parameters:
+        - { in: path, name: outboxEvent, required: true, schema: { type: integer } }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  parameters:
+    TicketId:
+      in: path
+      name: ticket
+      required: true
+      schema: { type: integer }
+    PerPage:
+      in: query
+      name: per_page
+      schema: { type: integer, minimum: 1, maximum: 100, default: 15 }
+    Page:
+      in: query
+      name: page
+      schema: { type: integer, minimum: 1, default: 1 }
+
+  responses:
+    AuthToken:
+      description: Authenticated
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+              user: { $ref: '#/components/schemas/User' }
+              token: { type: string, example: '1|abc...' }
+    TicketResponse:
+      description: OK
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: { $ref: '#/components/schemas/Ticket' }
+    UserResponse:
+      description: OK
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: { $ref: '#/components/schemas/User' }
+    Message:
+      description: OK
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            message: The subject field is required.
+            code: validation_failed
+            errors:
+              subject: [The subject field is required.]
+    Unauthenticated:
+      description: Missing or invalid token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: Unauthenticated., code: unauthenticated }
+    Forbidden:
+      description: Not allowed by policy
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: Customers can only close or reopen their own tickets., code: forbidden }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: Resource not found., code: not_found }
+    Conflict:
+      description: Conflict
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: This Idempotency-Key was already used with a different request payload., code: conflict }
+    TooManyRequests:
+      description: Rate limited
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [message, code]
+      properties:
+        message: { type: string }
+        code: { type: string }
+        errors:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+    Paginated:
+      type: object
+      properties:
+        links: { type: object }
+        meta:
+          type: object
+          properties:
+            current_page: { type: integer }
+            last_page: { type: integer }
+            per_page: { type: integer }
+            total: { type: integer }
+    Option:
+      type: object
+      properties:
+        value: { type: string }
+        label: { type: string }
+    Role:
+      type: string
+      enum: [customer, agent, admin]
+    TicketStatus:
+      type: string
+      enum: [open, in_progress, waiting_on_customer, resolved, closed]
+    TicketPriority:
+      type: string
+      enum: [low, normal, high, urgent]
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        teams: { type: array, items: { $ref: '#/components/schemas/Team' } }
+        created_at: { type: string, format: date-time }
+    Team:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        members: { type: array, items: { $ref: '#/components/schemas/User' } }
+        members_count: { type: integer }
+    TeamInput:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        member_ids: { type: array, items: { type: integer } }
+    Category:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        is_active: { type: boolean }
+        team_id: { type: integer, nullable: true }
+    CategoryInput:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        team_id: { type: integer, nullable: true }
+        is_active: { type: boolean }
+    SlaRule:
+      type: object
+      properties:
+        id: { type: integer }
+        priority: { $ref: '#/components/schemas/TicketPriority' }
+        priority_label: { type: string }
+        response_time_hours: { type: integer }
+        is_active: { type: boolean }
+    SlaRuleInput:
+      type: object
+      properties:
+        priority: { $ref: '#/components/schemas/TicketPriority' }
+        response_time_hours: { type: integer, minimum: 1 }
+        is_active: { type: boolean }
+    CreateTicket:
+      type: object
+      required: [subject, description, category_id]
+      properties:
+        subject: { type: string, maxLength: 255 }
+        description: { type: string, maxLength: 10000 }
+        category_id: { type: integer, description: Must be an active category }
+        priority: { $ref: '#/components/schemas/TicketPriority' }
+        team_id: { type: integer, nullable: true, description: Honoured for staff only }
+    Ticket:
+      type: object
+      properties:
+        id: { type: integer }
+        reference: { type: string, example: GN-000123 }
+        subject: { type: string }
+        description: { type: string }
+        priority: { $ref: '#/components/schemas/TicketPriority' }
+        priority_label: { type: string }
+        status: { $ref: '#/components/schemas/TicketStatus' }
+        status_label: { type: string }
+        allowed_transitions:
+          type: array
+          description: Statuses the current user may move this ticket to
+          items: { $ref: '#/components/schemas/TicketStatus' }
+        requester: { $ref: '#/components/schemas/User' }
+        assignee: { allOf: [{ $ref: '#/components/schemas/User' }], nullable: true }
+        team: { allOf: [{ $ref: '#/components/schemas/Team' }], nullable: true }
+        category: { $ref: '#/components/schemas/Category' }
+        attachments: { type: array, items: { $ref: '#/components/schemas/Attachment' } }
+        is_overdue: { type: boolean }
+        due_at: { type: string, format: date-time, nullable: true }
+        sla_breached_at: { type: string, format: date-time, nullable: true }
+        first_responded_at: { type: string, format: date-time, nullable: true }
+        resolved_at: { type: string, format: date-time, nullable: true }
+        closed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Comment:
+      type: object
+      properties:
+        id: { type: integer }
+        ticket_id: { type: integer }
+        body: { type: string }
+        type: { type: string, enum: [public, internal] }
+        is_internal: { type: boolean }
+        user: { $ref: '#/components/schemas/User' }
+        created_at: { type: string, format: date-time }
+    Attachment:
+      type: object
+      properties:
+        id: { type: integer }
+        ticket_id: { type: integer }
+        original_name: { type: string }
+        mime_type: { type: string }
+        file_size: { type: integer }
+        uploaded_by: { $ref: '#/components/schemas/User' }
+        download_url: { type: string, format: uri }
+        created_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [ticket.created, ticket.assigned, ticket.status_changed, ticket.sla_breached] }
+        data:
+          type: object
+          properties:
+            event_id: { type: string, format: uuid }
+            event_type: { type: string }
+            ticket_id: { type: integer }
+            reference: { type: string }
+            subject: { type: string }
+            message: { type: string }
+        read_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        action: { type: string, enum: [created, updated, deleted] }
+        auditable_type: { type: string, example: Ticket }
+        auditable_id: { type: integer }
+        old_values: { type: object, nullable: true }
+        new_values: { type: object, nullable: true }
+        user: { allOf: [{ $ref: '#/components/schemas/User' }], nullable: true, description: Null for system actions (scheduler) }
+        created_at: { type: string, format: date-time }
+    OutboxEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        event_id: { type: string, format: uuid }
+        event_type: { type: string }
+        aggregate_type: { type: string }
+        aggregate_id: { type: integer }
+        payload: { type: object }
+        attempts: { type: integer }
+        last_error: { type: string, nullable: true }
+        processed_at: { type: string, format: date-time, nullable: true }
+        failed_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
